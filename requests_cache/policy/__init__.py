@@ -23,4 +23,5 @@ HeaderDict = MutableMapping[str, str]
 from .expiration import *
 from .settings import *
 from .directives import CacheDirectives, set_request_headers
+from .decision import *
 from .actions import CacheActions

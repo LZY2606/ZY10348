@@ -37,6 +37,7 @@ class CacheSettings(RichMixin):
     always_revalidate: bool = field(default=False)
     autoclose: bool = field(default=True)
     cache_control: bool = field(default=False)
+    cache_trace: bool = field(default=False)
     content_root_key: Optional[str] = field(default=None)
     disabled: bool = field(default=False)
     expire_after: ExpirationTime = field(default=None)

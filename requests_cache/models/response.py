@@ -38,6 +38,8 @@ class BaseResponse(Response):
     cache_key: str = ''  # Not serialized; set by BaseCache.get_response()
     revalidated: bool = False  # Not serialized; set by CacheActions.update_revalidated_response()
     has_content_changed: Optional[bool] = None  # Not serialized; set when refreshing a response
+    # Not serialized; set by CachedSession.send() when cache_trace is enabled
+    cache_decision = None  # type: Optional[CacheDecision]
 
     @property
     def from_cache(self) -> bool:

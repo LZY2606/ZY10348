@@ -1,6 +1,9 @@
 # History
 
 ## Unreleased
+* Add optional `CacheDecision` trace (`CachedSession(cache_trace=True)`), available as
+  `response.cache_decision`, recording how cache key, policy, request/response directives, and
+  staleness/revalidation checks determined the final action for a request
 * Fix unhandled `EOFError` when a cache value fails to deserialize
 
 ## 1.3.3 (2026-07-03)

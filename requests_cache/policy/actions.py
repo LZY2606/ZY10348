@@ -18,8 +18,17 @@ from . import (
     KeyCallback,
     get_expiration_datetime,
     get_expiration_seconds,
+    get_matching_url_pattern,
     get_url_expiration,
     utcnow,
+)
+from .decision import (
+    ACTION_REVALIDATED,
+    CacheDecision,
+    CacheGeneration,
+    redact_headers,
+    summarize_key,
+    url_rule_name,
 )
 from .settings import CacheSettings
 
@@ -56,10 +65,13 @@ class CacheActions(RichMixin):
         resend_async: Return a stale cache item, and send a non-blocking request to refresh it
         skip_read: Skip reading from the cache
         skip_write: Skip writing to the cache
+        decision: Optional :py:class:`.CacheDecision` trace; only populated when
+            ``cache_trace`` is enabled
     """
 
     # Outputs
     cache_key: str = field(default=None, repr=False)
+    decision: Optional[CacheDecision] = field(default=None)
     error_504: bool = field(default=False)
     expire_after: ExpirationTime = field(default=None)
     send_request: bool = field(default=False)
@@ -77,6 +89,7 @@ class CacheActions(RichMixin):
     _only_if_cached: bool = field(default=False, repr=False)
     _refresh: bool = field(default=False, repr=False)
     _request: PreparedRequest = field(default=None, repr=False)
+    _now: Optional[datetime] = field(default=None, repr=False)
     _stale_if_error: Union[bool, ExpirationTime] = field(default=None, repr=False)
     _stale_while_revalidate: Union[bool, ExpirationTime] = field(default=None, repr=False)
     _validation_headers: Dict[str, str] = field(factory=dict, repr=False)
@@ -88,6 +101,7 @@ class CacheActions(RichMixin):
         cache_key: str,
         request: PreparedRequest,
         settings: Optional[CacheSettings] = None,
+        serializer=None,
     ):
         """Initialize from request info and cache settings.
 
@@ -100,15 +114,17 @@ class CacheActions(RichMixin):
             cache_key: The cache key created based on the initial request
             request: The outgoing request
             settings: Session-level cache settings
+            serializer: Serializer used by the cache backend; only recorded in the decision trace
         """
         settings = settings or CacheSettings()
         directives = CacheDirectives.from_headers(request.headers)
         logger.debug(f'Cache directives from request headers: {directives}')
 
         # Check expiration values in order of precedence
+        url_expire_after = get_url_expiration(request.url, settings.urls_expire_after)
         expire_after = coalesce(
             directives.max_age,
-            get_url_expiration(request.url, settings.urls_expire_after),
+            url_expire_after,
             settings.expire_after,
         )
 
@@ -144,7 +160,60 @@ class CacheActions(RichMixin):
             stale_if_error=stale_if_error,
             stale_while_revalidate=stale_while_revalidate,
         )
+        if settings.cache_trace:
+            actions.decision = actions._build_decision(
+                url_expire_after=url_expire_after,
+                read_criteria=read_criteria,
+                serializer=serializer,
+            )
         return actions
+
+    def _build_decision(self, url_expire_after, read_criteria, serializer=None) -> CacheDecision:
+        """Create a decision trace based on request info and settings. Records values already
+        determined during :py:meth:`from_request`; does not read the clock or the cache backend.
+        """
+        if self._directives.max_age is not None:
+            expiration_source = 'request'
+        elif url_expire_after is not None:
+            expiration_source = 'url_rule'
+        elif self._settings.expire_after is not None:
+            expiration_source = 'session'
+        else:
+            expiration_source = None
+
+        url_rule = get_matching_url_pattern(self._request.url, self._settings.urls_expire_after)
+        return CacheDecision(
+            cache_key=self.cache_key,
+            key_summary=summarize_key(self._request, self._settings, serializer),
+            disabled=self._settings.disabled,
+            expire_after=self.expire_after,
+            expiration_source=expiration_source,
+            max_stale=self._directives.max_stale,
+            min_fresh=self._directives.min_fresh,
+            only_if_cached=self._only_if_cached,
+            read_skip_reasons=[k for k, v in read_criteria.items() if v],
+            refresh=self._refresh,
+            request_directives=self._directives,
+            stale_if_error=self._stale_if_error,
+            stale_while_revalidate=self._stale_while_revalidate,
+            url_rule=url_rule_name(url_rule),
+        )
+
+    def set_decision_action(self, action: str):
+        """Record the final action in the decision trace, if tracing is enabled"""
+        if self.decision is not None:
+            self.decision.action = action
+
+    def record_vary_secondary(self, vary_key: str, secondary_hit: bool):
+        """Record the result of a secondary Vary-qualified cache lookup, if tracing is enabled"""
+        if self.decision is not None:
+            self.decision.cache_key = vary_key
+            self.decision.vary.secondary_hit = secondary_hit
+
+    def attach_decision(self, response):
+        """Attach the decision trace to a response, if tracing is enabled"""
+        if self.decision is not None:
+            response.cache_decision = self.decision
 
     @property
     def expires(self) -> Optional[datetime]:
@@ -180,7 +249,15 @@ class CacheActions(RichMixin):
         else:
             offset = self._directives.get_expire_offset()
 
-        return utcnow() < cached_response.expires + offset
+        return self._current_time() < cached_response.expires + offset
+
+    def _current_time(self) -> datetime:
+        """Get the current time, reading the clock only once per request so all staleness checks
+        (and the decision trace) observe the same value
+        """
+        if self._now is None:
+            self._now = utcnow()
+        return self._now
 
     def update_from_cached_response(
         self,
@@ -221,7 +298,28 @@ class CacheActions(RichMixin):
 
         if cached_response is not None and not self._only_if_cached:
             self._update_validation_headers(cached_response)
+        self._record_read_decision(cached_response)
         logger.debug(f'Post-read cache actions: {self}')
+
+    def _record_read_decision(self, cached_response: Optional['CachedResponse']):
+        """Record the results of a cache read in the decision trace, if tracing is enabled"""
+        if self.decision is None:
+            return
+        self.decision.backend_hit = cached_response is not None
+        self.decision.conditional_headers = dict(self._validation_headers)
+        if cached_response is None:
+            return
+        self.decision.now = self._now
+        self.decision.stored_created_at = cached_response.created_at
+        self.decision.stored_expires = cached_response.expires
+        if self._now is not None and cached_response.created_at is not None:
+            self.decision.stored_age = self._now - cached_response.created_at
+        # Record the first Vary-bearing check; a secondary Vary-qualified lookup may follow
+        vary_header = cached_response.headers.get('Vary')
+        if vary_header and self.decision.vary.header is None:
+            self.decision.vary.header = vary_header
+            self.decision.vary.matched = self._vary_matched
+            self.decision.vary.vary_cache_key = self.vary_cache_key
 
     def update_from_response(self, response: Response):
         """Update expiration + actions based on headers and other details from a new response.
@@ -253,6 +351,11 @@ class CacheActions(RichMixin):
         self.skip_write = any(write_criteria.values())
         _log_cache_criteria('write', write_criteria)
 
+        if self.decision is not None:
+            self.decision.response_directives = directives
+            self.decision.expire_after = self.expire_after
+            self.decision.write_skip_reasons = [k for k, v in write_criteria.items() if v]
+
     def update_request(self, request: PreparedRequest) -> PreparedRequest:
         """Apply validation headers (if any) before sending a request"""
         request.headers.update(self._validation_headers)
@@ -263,6 +366,18 @@ class CacheActions(RichMixin):
     ) -> 'CachedResponse':
         """After revalidation, update the cached response's expiration and headers"""
         logger.debug(f'Response for URL {response.request.url} has not been modified')
+
+        # Record the previous generation (which provides the body) before updating
+        record = self.decision is not None and not self.resend_async
+        if record:
+            stored_generation = CacheGeneration(
+                source='stored',
+                status_code=cached_response.status_code,
+                created_at=cached_response.created_at,
+                expires=cached_response.expires,
+                headers=redact_headers(cached_response.headers, self._settings.ignored_parameters),
+                body_size=len(cached_response._content or b''),
+            )
 
         # Skip updating the cached response if expiration and headers are unchanged
         # OR if session/request settings skip it.
@@ -289,6 +404,28 @@ class CacheActions(RichMixin):
 
         cached_response.revalidated = True
         cached_response.has_content_changed = False
+
+        # Link the old and new generations in the decision trace
+        if record:
+            self.decision.generations = [
+                stored_generation,
+                CacheGeneration(
+                    source='origin',
+                    status_code=response.status_code,
+                    created_at=None,
+                    expires=cached_response.expires,
+                    headers=redact_headers(response.headers, self._settings.ignored_parameters),
+                    body_size=0,
+                ),
+            ]
+            self.decision.action = ACTION_REVALIDATED
+            self.decision.expire_after = self.expire_after
+            if not self.skip_write:
+                self.decision.write_skip_reasons = []
+            elif permanent_skip:
+                self.decision.write_skip_reasons = ['read-only, disabled, or no-store']
+            else:
+                self.decision.write_skip_reasons = ['unchanged']
         return cached_response
 
     def _update_from_response_headers(self, directives: CacheDirectives):
@@ -305,6 +442,11 @@ class CacheActions(RichMixin):
                 self.expire_after,
             )
         self.skip_write = self.skip_write or directives.no_store
+
+        if self.decision is not None and (
+            directives.immutable or directives.max_age is not None or directives.expires
+        ):
+            self.decision.expiration_source = 'response'
 
     def _update_validation_headers(self, cached_response: 'CachedResponse'):
         """If needed, get validation headers based on a cached response. Revalidation may be

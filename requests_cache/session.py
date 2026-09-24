@@ -13,6 +13,12 @@ from ._utils import get_valid_kwargs, patch_form_boundary
 from .backends import BackendSpecifier, StrOrPath, init_backend
 from .models import AnyResponse, CachedResponse, OriginalResponse
 from .policy import (
+    ACTION_ERROR_504,
+    ACTION_HIT,
+    ACTION_RESEND,
+    ACTION_SEND,
+    ACTION_STALE_IF_ERROR,
+    ACTION_STALE_WHILE_REVALIDATE,
     DEFAULT_CACHE_NAME,
     DEFAULT_IGNORED_PARAMS,
     DEFAULT_METHODS,
@@ -49,6 +55,7 @@ class CacheMixin(MIXIN_BASE):
         expire_after: ExpirationTime = -1,
         urls_expire_after: Optional[ExpirationPatterns] = None,
         cache_control: bool = False,
+        cache_trace: bool = False,
         content_root_key: Optional[str] = None,
         allowable_codes: Iterable[int] = DEFAULT_STATUS_CODES,
         allowable_methods: Iterable[str] = DEFAULT_METHODS,
@@ -67,6 +74,7 @@ class CacheMixin(MIXIN_BASE):
             expire_after=expire_after,
             urls_expire_after=urls_expire_after,
             cache_control=cache_control,
+            cache_trace=cache_trace,
             content_root_key=content_root_key,
             allowable_codes=allowable_codes,
             allowable_methods=allowable_methods,
@@ -215,7 +223,10 @@ class CacheMixin(MIXIN_BASE):
             request.headers, expire_after, only_if_cached, refresh, force_refresh
         )
         actions = CacheActions.from_request(
-            self.cache.create_key(request, **kwargs), request, self.settings
+            self.cache.create_key(request, **kwargs),
+            request,
+            self.settings,
+            serializer=self.cache.responses.serializer,
         )
 
         # Attempt to fetch a cached response
@@ -231,6 +242,7 @@ class CacheMixin(MIXIN_BASE):
             vary_cached = self.cache.get_response(vary_key)
             # Use the Vary-qualified key for any future storage (hit or miss)
             actions.cache_key = vary_key
+            actions.record_vary_secondary(vary_key, vary_cached is not None)
             if vary_cached is not None:
                 # Reset decision flags from the failed primary Vary check
                 actions.send_request = False
@@ -245,18 +257,26 @@ class CacheMixin(MIXIN_BASE):
 
         # Handle missing and expired responses based on settings and headers
         if actions.error_504:
+            actions.set_decision_action(ACTION_ERROR_504)
             response: AnyResponse = get_504_response(request)
         elif actions.resend_async:
+            actions.set_decision_action(ACTION_STALE_WHILE_REVALIDATE)
             self._resend_async(request, actions, cached_response, **kwargs)
             response = cached_response  # type: ignore
         elif actions.resend_request:
+            actions.set_decision_action(ACTION_RESEND)
             response = self._resend(request, actions, cached_response, **kwargs)  # type: ignore
             if isinstance(response, OriginalResponse) and actions._vary_matched:
                 response.update_content_changed(cached_response)
         elif actions.send_request:
+            actions.set_decision_action(ACTION_SEND)
             response = self._send_and_cache(request, actions, cached_response, **kwargs)
         else:
+            actions.set_decision_action(ACTION_HIT)
             response = cached_response  # type: ignore  # Guaranteed to be non-None by this point
+
+        # Attach the decision trace, if enabled
+        actions.attach_decision(response)
 
         # If the request has been filtered out and was previously cached, delete it
         if self.settings.filter_fn is not None and not self.settings.filter_fn(response):
@@ -339,6 +359,7 @@ class CacheMixin(MIXIN_BASE):
                 f'Request for URL {cached_response.request.url} failed; using cached response',
                 exc_info=True,
             )
+            actions.set_decision_action(ACTION_STALE_IF_ERROR)
             return cached_response
         else:
             raise
@@ -398,6 +419,8 @@ class CachedSession(CacheMixin, OriginalSession):
         expire_after: Time after which cached items will expire. See :ref:`expiration` for details.
         urls_expire_after: Expiration times to apply for different URL patterns
         cache_control: Use Cache-Control and other response headers to set expiration
+        cache_trace: Record a :py:class:`.CacheDecision` trace for each request, available as
+            ``response.cache_decision``
         allowable_codes: Only cache responses with one of these status codes
         allowable_methods: Cache only responses for one of these HTTP methods
         always_revalidate: Revalidate with the server for every request, even if the cached response
