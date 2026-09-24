@@ -17,6 +17,11 @@ from .policy import (
     DEFAULT_IGNORED_PARAMS,
     DEFAULT_METHODS,
     DEFAULT_STATUS_CODES,
+    CACHE_HIT,
+    FETCH,
+    NOT_CACHED,
+    STALE_IF_ERROR,
+    STALE_WHILE_REVALIDATE,
     CacheActions,
     CacheSettings,
     ExpirationPatterns,
@@ -219,9 +224,39 @@ class CacheMixin(MIXIN_BASE):
         )
 
         # Attempt to fetch a cached response
+        cached_response = self._get_cached_response(request, actions, **kwargs)
+
+        # Handle missing and expired responses based on settings and headers
+        if actions.error_504:
+            self._set_action(actions, NOT_CACHED)
+            response: AnyResponse = get_504_response(request)
+        elif actions.resend_async:
+            self._set_action(actions, STALE_WHILE_REVALIDATE)
+            self._resend_async(request, actions, cached_response, **kwargs)
+            response = cached_response  # type: ignore
+        elif actions.resend_request:
+            self._set_action(actions, FETCH)
+            response = self._resend(request, actions, cached_response, **kwargs)  # type: ignore
+            if isinstance(response, OriginalResponse) and actions._vary_matched:
+                response.update_content_changed(cached_response)
+        elif actions.send_request:
+            self._set_action(actions, FETCH)
+            response = self._send_and_cache(request, actions, cached_response, **kwargs)
+        else:
+            self._set_action(actions, CACHE_HIT)
+            response = cached_response  # type: ignore  # Guaranteed to be non-None by this point
+
+        return self._finalize_response(response, request, actions, **kwargs)
+
+    def _get_cached_response(
+        self, request: PreparedRequest, actions: CacheActions, **kwargs
+    ) -> Optional[CachedResponse]:
+        """Attempt to fetch a cached response, including a secondary Vary-qualified lookup"""
         cached_response: Optional[CachedResponse] = None
         if not actions.skip_read:
             cached_response = self.cache.get_response(actions.cache_key)
+        if actions._decision is not None and not actions.skip_read:
+            actions._decision.backend_hit = cached_response is not None
         actions.update_from_cached_response(cached_response, self.cache.create_key, **kwargs)
 
         # Secondary Vary lookup: if the primary entry didn't match on Vary,
@@ -231,6 +266,13 @@ class CacheMixin(MIXIN_BASE):
             vary_cached = self.cache.get_response(vary_key)
             # Use the Vary-qualified key for any future storage (hit or miss)
             actions.cache_key = vary_key
+            if actions._decision is not None:
+                actions._decision.cache_key = vary_key
+                actions._decision.add_check(
+                    'vary secondary key',
+                    'hit' if vary_cached is not None else 'miss',
+                    detail=vary_key,
+                )
             if vary_cached is not None:
                 # Reset decision flags from the failed primary Vary check
                 actions.send_request = False
@@ -242,21 +284,18 @@ class CacheMixin(MIXIN_BASE):
                 # Re-evaluate freshness/expiry with the Vary-matched response
                 actions.update_from_cached_response(vary_cached, self.cache.create_key, **kwargs)
                 cached_response = vary_cached
+        return cached_response
 
-        # Handle missing and expired responses based on settings and headers
-        if actions.error_504:
-            response: AnyResponse = get_504_response(request)
-        elif actions.resend_async:
-            self._resend_async(request, actions, cached_response, **kwargs)
-            response = cached_response  # type: ignore
-        elif actions.resend_request:
-            response = self._resend(request, actions, cached_response, **kwargs)  # type: ignore
-            if isinstance(response, OriginalResponse) and actions._vary_matched:
-                response.update_content_changed(cached_response)
-        elif actions.send_request:
-            response = self._send_and_cache(request, actions, cached_response, **kwargs)
-        else:
-            response = cached_response  # type: ignore  # Guaranteed to be non-None by this point
+    def _finalize_response(
+        self,
+        response: AnyResponse,
+        request: PreparedRequest,
+        actions: CacheActions,
+        **kwargs,
+    ) -> AnyResponse:
+        """Attach the decision trace (if enabled), apply the response filter, and dispatch hooks"""
+        if actions._decision is not None:
+            response.cache_decision = actions._decision
 
         # If the request has been filtered out and was previously cached, delete it
         if self.settings.filter_fn is not None and not self.settings.filter_fn(response):
@@ -282,7 +321,15 @@ class CacheMixin(MIXIN_BASE):
         actions.update_from_response(response)
 
         if not actions.skip_write:
-            self.cache.save_response(response, actions.cache_key, actions.expires)
+            expires = actions.expires
+            self.cache.save_response(response, actions.cache_key, expires)
+            if actions._decision is not None:
+                actions._decision.add_generation(
+                    status_code=response.status_code,
+                    headers=response.headers,
+                    created_at=actions._decision.now,
+                    expires=expires,
+                )
         elif cached_response is not None and response.status_code == 304:
             cached_response = actions.update_revalidated_response(
                 response, CachedResponse.from_response(cached_response)
@@ -339,9 +386,18 @@ class CacheMixin(MIXIN_BASE):
                 f'Request for URL {cached_response.request.url} failed; using cached response',
                 exc_info=True,
             )
+            self._set_action(actions, STALE_IF_ERROR)
+            if actions._decision is not None:
+                actions._decision.add_check('stale_if_error', 'used stale response')
             return cached_response
         else:
             raise
+
+    @staticmethod
+    def _set_action(actions: CacheActions, action: str):
+        """Record the final cache action, if decision tracing is enabled"""
+        if actions._decision is not None:
+            actions._decision.action = action
 
     @contextmanager
     def cache_disabled(self):
@@ -411,6 +467,8 @@ class CachedSession(CacheMixin, OriginalSession):
             accepts a time value representing maximum staleness to accept.
         stale_while_revalidate: Return a stale response initially, while a non-blocking request is
             sent to refresh the response for the next time it's requested
+        trace_decisions: Record a :py:class:`.CacheDecision` trace for each request, available as
+            ``response.cache_decision``. Disabled by default.
         autoclose: Close the cache backend when the session is closed
         filter_fn: Response filtering function that indicates whether or not a given response should
             be cached. See :ref:`custom-filtering` for details.

@@ -2,6 +2,13 @@
 
 ## Unreleased
 * Fix unhandled `EOFError` when a cache value fails to deserialize
+* Add optional cache decision tracing: with `CachedSession(trace_decisions=True)`, each response
+  gets a `cache_decision` attribute (a `CacheDecision`) recording how the cache policy arrived at
+  its final action: cache key composition, matched URL expiration pattern, request/response cache
+  directives, stored response age, conditional request headers, backend hits, individual policy
+  checks (`Vary`, `only-if-cached`, `max-stale`, `stale-if-error`, disabled cache, etc.), and
+  response generations linking a 304 revalidation to the original cached response. Sensitive
+  header values and request/response bodies are never recorded. Disabled by default.
 
 ## 1.3.3 (2026-07-03)
 * Add `CachedResponse.has_content_changed` to flag whether a refresh differs from the cache, when a reliable comparison is available.

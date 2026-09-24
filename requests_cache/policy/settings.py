@@ -48,6 +48,7 @@ class CacheSettings(RichMixin):
     read_only: bool = field(default=False)
     stale_if_error: Union[bool, ExpirationTime] = field(default=False)
     stale_while_revalidate: Union[bool, ExpirationTime] = field(default=False)
+    trace_decisions: bool = field(default=False)
     urls_expire_after: Dict[ExpirationPattern, ExpirationTime] = field(factory=dict)
 
     @classmethod

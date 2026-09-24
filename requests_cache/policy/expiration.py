@@ -67,13 +67,23 @@ def get_url_expiration(
     url: Optional[str], urls_expire_after: Optional[ExpirationPatterns] = None
 ) -> ExpirationTime:
     """Check for a matching per-URL expiration, if any"""
+    pattern = get_url_expiration_pattern(url, urls_expire_after)
+    if pattern is not None:
+        expire_after = (urls_expire_after or {})[pattern]
+        logger.debug(f'URL {url} matched pattern "{pattern}": {expire_after}')
+        return expire_after
+    return None
+
+
+def get_url_expiration_pattern(
+    url: Optional[str], urls_expire_after: Optional[ExpirationPatterns] = None
+) -> Optional[ExpirationPattern]:
+    """Get the first matching per-URL expiration pattern, if any"""
     if not url:
         return None
-
-    for pattern, expire_after in (urls_expire_after or {}).items():
+    for pattern in urls_expire_after or {}:
         if _url_match(url, pattern):
-            logger.debug(f'URL {url} matched pattern "{pattern}": {expire_after}')
-            return expire_after
+            return pattern
     return None
 
 

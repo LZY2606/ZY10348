@@ -13,6 +13,7 @@ from requests.structures import CaseInsensitiveDict
 
 from .._utils import is_json_content_type
 from ..policy import ExpirationTime, add_tzinfo, get_expiration_datetime, utcnow
+from ..policy.decision import CacheDecision
 from . import CachedHTTPResponse, CachedRequest, RichMixin
 
 if TYPE_CHECKING:
@@ -38,6 +39,7 @@ class BaseResponse(Response):
     cache_key: str = ''  # Not serialized; set by BaseCache.get_response()
     revalidated: bool = False  # Not serialized; set by CacheActions.update_revalidated_response()
     has_content_changed: Optional[bool] = None  # Not serialized; set when refreshing a response
+    cache_decision: Optional[CacheDecision] = None  # Not serialized; set if trace_decisions=True
 
     @property
     def from_cache(self) -> bool:

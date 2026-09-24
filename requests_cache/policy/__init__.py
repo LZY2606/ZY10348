@@ -23,4 +23,16 @@ HeaderDict = MutableMapping[str, str]
 from .expiration import *
 from .settings import *
 from .directives import CacheDirectives, set_request_headers
+from .decision import (
+    CACHE_HIT,
+    FETCH,
+    NOT_CACHED,
+    REVALIDATED,
+    STALE_IF_ERROR,
+    STALE_WHILE_REVALIDATE,
+    CacheCheck,
+    CacheDecision,
+    KeySummary,
+    ResponseGeneration,
+)
 from .actions import CacheActions

@@ -21,6 +21,7 @@ from . import (
     get_url_expiration,
     utcnow,
 )
+from .decision import REVALIDATED, STALE_WHILE_REVALIDATE, CacheDecision, directives_dict
 from .settings import CacheSettings
 
 if TYPE_CHECKING:
@@ -81,6 +82,7 @@ class CacheActions(RichMixin):
     _stale_while_revalidate: Union[bool, ExpirationTime] = field(default=None, repr=False)
     _validation_headers: Dict[str, str] = field(factory=dict, repr=False)
     _vary_matched: bool = field(default=True, repr=False)
+    _decision: Optional[CacheDecision] = field(default=None, repr=False)
 
     @classmethod
     def from_request(
@@ -144,6 +146,19 @@ class CacheActions(RichMixin):
             stale_if_error=stale_if_error,
             stale_while_revalidate=stale_while_revalidate,
         )
+        if settings.trace_decisions:
+            actions._decision = CacheDecision.for_request(
+                cache_key=cache_key,
+                request=request,
+                settings=settings,
+                directives=directives,
+                expire_after=expire_after,
+                read_criteria=read_criteria,
+                only_if_cached=only_if_cached,
+                refresh=refresh,
+                stale_if_error=stale_if_error,
+                stale_while_revalidate=stale_while_revalidate,
+            )
         return actions
 
     @property
@@ -202,6 +217,9 @@ class CacheActions(RichMixin):
         usable_response = self.is_usable(cached_response)
         usable_if_error = self.is_usable(cached_response, error=True)
 
+        if self._decision is not None and cached_response is not None:
+            self._decision.record_stored_response(cached_response)
+
         # Can't satisfy the request
         if not usable_response and self._only_if_cached and not usable_if_error:
             self.error_504 = True
@@ -219,9 +237,31 @@ class CacheActions(RichMixin):
         elif cached_response.is_expired and usable_response and self._stale_while_revalidate:
             self.resend_async = True
 
+        if self._decision is not None:
+            self._record_read_outcome(cached_response, usable_response, usable_if_error)
+
         if cached_response is not None and not self._only_if_cached:
             self._update_validation_headers(cached_response)
         logger.debug(f'Post-read cache actions: {self}')
+
+    def _record_read_outcome(
+        self,
+        cached_response: Optional['CachedResponse'],
+        usable_response: bool,
+        usable_if_error: bool,
+    ):
+        """Record the outcome of evaluating a cached response against the request"""
+        assert self._decision is not None
+        if cached_response is None:
+            self._decision.add_check('freshness', 'miss')
+        elif usable_response:
+            self._decision.add_check('freshness', 'fresh')
+        elif usable_if_error:
+            self._decision.add_check('freshness', 'stale (usable only on error)')
+        else:
+            self._decision.add_check('freshness', 'stale')
+        if self.error_504:
+            self._decision.add_check('only_if_cached', 'unsatisfiable', detail='returning 504')
 
     def update_from_response(self, response: Response):
         """Update expiration + actions based on headers and other details from a new response.
@@ -253,6 +293,14 @@ class CacheActions(RichMixin):
         self.skip_write = any(write_criteria.values())
         _log_cache_criteria('write', write_criteria)
 
+        if self._decision is not None:
+            self._decision.response_directives = directives_dict(directives)
+            self._decision.expire_after = self.expire_after
+            failed = ', '.join(k for k, v in write_criteria.items() if v)
+            self._decision.add_check(
+                'cache write', 'skipped' if self.skip_write else 'allowed', detail=failed or None
+            )
+
     def update_request(self, request: PreparedRequest) -> PreparedRequest:
         """Apply validation headers (if any) before sending a request"""
         request.headers.update(self._validation_headers)
@@ -276,7 +324,8 @@ class CacheActions(RichMixin):
         )
         self.skip_write = permanent_skip or not (expiration_changed or headers_changed)
 
-        cached_response.expires = self.expires
+        new_expires = self.expires
+        cached_response.expires = new_expires
 
         # Update headers;
         # Account for Transfer-Encoding in original response and Content-Length in 304 response
@@ -289,6 +338,17 @@ class CacheActions(RichMixin):
 
         cached_response.revalidated = True
         cached_response.has_content_changed = False
+        if self._decision is not None:
+            # Link the new generation (updated headers/expiration) to the stored one (body source)
+            self._decision.add_generation(
+                status_code=cached_response.status_code,
+                headers=cached_response.headers,
+                created_at=self._decision.now,
+                expires=new_expires,
+                revalidated_from=len(self._decision.generations) - 1,
+            )
+            if self._decision.action != STALE_WHILE_REVALIDATE:
+                self._decision.action = REVALIDATED
         return cached_response
 
     def _update_from_response_headers(self, directives: CacheDirectives):
@@ -305,6 +365,13 @@ class CacheActions(RichMixin):
                 self.expire_after,
             )
         self.skip_write = self.skip_write or directives.no_store
+        if self._decision is not None:
+            if directives.immutable:
+                self._decision.expiration_source = 'response immutable'
+            elif directives.max_age is not None:
+                self._decision.expiration_source = 'response max-age'
+            elif directives.expires is not None:
+                self._decision.expiration_source = 'response expires'
 
     def _update_validation_headers(self, cached_response: 'CachedResponse'):
         """If needed, get validation headers based on a cached response. Revalidation may be
@@ -328,6 +395,8 @@ class CacheActions(RichMixin):
                 self._validation_headers['If-Modified-Since'] = directives.last_modified
             self.send_request = False
             self.resend_request = True
+            if self._decision is not None:
+                self._decision.conditional_headers = dict(self._validation_headers)
 
     def _validate_vary(
         self, cached_response: 'CachedResponse', create_key: KeyCallback, **key_kwargs
@@ -337,6 +406,7 @@ class CacheActions(RichMixin):
         if not vary:
             return True
         elif vary == '*':
+            self._record_vary_check(vary, False)
             return False
 
         # Generate a secondary cache key based on Vary for both the cached request and new request.
@@ -352,10 +422,12 @@ class CacheActions(RichMixin):
         if 'cookie' in match_headers:
             if not self._cookies_match(vary_request):
                 logger.debug('Failed Vary check: cookies do not match')
+                self._record_vary_check(vary, False)
                 return False
             match_headers.remove('cookie')
 
         if not match_headers:
+            self._record_vary_check(vary, True)
             return True
 
         # If a Vary header is in ignored_parameters and on the request, treat it as a cache miss
@@ -366,6 +438,7 @@ class CacheActions(RichMixin):
             logger.debug(
                 f'Failed Vary check: Vary header(s) are in ignored_parameters: {ignore_overlap}'
             )
+            self._record_vary_check(vary, False)
             return False
 
         key_kwargs['match_headers'] = match_headers
@@ -382,7 +455,13 @@ class CacheActions(RichMixin):
             merged = self._merge_match_headers(match_headers)
             key_kwargs['match_headers'] = merged
             self.vary_cache_key = create_key(self._request, **key_kwargs)
+        self._record_vary_check(vary, headers_match)
         return headers_match
+
+    def _record_vary_check(self, vary: str, matched: bool):
+        """Record the outcome of a Vary check, if tracing is enabled"""
+        if self._decision is not None:
+            self._decision.add_check('vary', 'matched' if matched else 'mismatch', detail=vary)
 
     def _cookies_match(self, cached_request: 'CachedRequest') -> bool:
         """Compare cookies between the current request and cached request for Vary: Cookie"""
